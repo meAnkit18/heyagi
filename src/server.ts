@@ -10,6 +10,8 @@ import express from "express";
 import cors from "cors";
 import type { SimpleMessage } from "./provider/index.js";
 import { ceoBrain } from "./agents/Ceo/brain.js";
+import { processTask } from "./agents/Task_Manager/brain.js";
+import { createTaskLogger } from "./agents/Task_Manager/task-logger.js";
 import {
   getMemoryStatus,
   searchMemory,
@@ -59,9 +61,102 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// Task processing endpoint — receives task from CEO for processing
+app.post("/task", async (req, res) => {
+  const { taskId, taskSummary } = req.body;
+
+  if (!taskId || !taskSummary) {
+    res.status(400).json({ error: "Missing taskId or taskSummary in body" });
+    return;
+  }
+
+  try {
+    // Process the task using Task_Manager
+    const { plan, contextFilePath } = await processTask(
+      taskId, taskSummary, path.join(__dirname, "..", "memory", "tasks")
+    );
+    res.json({
+      success: true,
+      message: `Task ${taskId} processed successfully`,
+      stepsCount: plan.steps.length,
+      contextFile: contextFilePath,
+    });
+  } catch (err: any) {
+    console.error("Task processing error:", err?.message ?? err);
+    res.status(500).json({ error: "Task processing failed" });
+  }
+});
+
+// ── SSE streaming endpoint for task processing logs ───────
+
+/** GET /task/stream?taskId=...&taskSummary=... — streams task processing logs via SSE */
+app.get("/task/stream", async (req, res) => {
+  const taskId = req.query.taskId as string;
+  const taskSummary = req.query.taskSummary as string;
+
+  if (!taskId || !taskSummary) {
+    res.status(400).json({ error: "Missing taskId or taskSummary query params" });
+    return;
+  }
+
+  // Set SSE headers
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "Access-Control-Allow-Origin": "*",
+  });
+
+  // Create a logger for this task
+  const logger = createTaskLogger(taskId);
+
+  // Stream each log event to the client
+  logger.on("log", (event) => {
+    res.write(`data: ${JSON.stringify(event)}\n\n`);
+  });
+
+  // When the task is done, close the stream
+  logger.on("done", () => {
+    res.write(`data: ${JSON.stringify({ type: "close" })}\n\n`);
+    res.end();
+  });
+
+  // Handle client disconnect
+  req.on("close", () => {
+    logger.removeAllListeners();
+  });
+
+  // Process the task with the logger
+  try {
+    await processTask(
+      taskId,
+      taskSummary,
+      path.join(__dirname, "..", "memory", "tasks"),
+      logger
+    );
+  } catch (err: any) {
+    logger.log("error", `Task failed: ${err?.message ?? err}`);
+    logger.done("Task processing failed");
+  }
+});
+
 // Get chat history
 app.get("/messages", (_req, res) => {
   res.json({ messages });
+});
+
+// ── Task context endpoint ─────────────────────────────────
+
+/** GET /task/context — returns the current TASK_CONTEXT.md content */
+app.get("/task/context", async (_req, res) => {
+  const contextPath = path.join(__dirname, "..", "memory", "tasks", "TASK_CONTEXT.md");
+  try {
+    const { readFile } = await import("fs/promises");
+    const content = await readFile(contextPath, "utf-8");
+    res.json({ exists: true, content });
+  } catch {
+    res.json({ exists: false, content: null });
+  }
 });
 
 // ── Memory endpoints ──────────────────────────────────────
