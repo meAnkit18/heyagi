@@ -4,6 +4,7 @@ import {
   TaskAssignment,
   ExecutionStep,
   ExecutionPlan,
+  AgentManifest,
   TASK_MANAGER_SYSTEM_PROMPT,
 } from "./Schema.js";
 import { chat, type SimpleMessage } from "../../provider/index.js";
@@ -114,18 +115,23 @@ export function breakDownTask(taskSummary: string): Subtask[] {
  */
 export async function breakDownTaskWithLLM(
   taskSummary: string,
-  availableAgents: string[]
+  availableAgents: string[] | AgentManifest[]
 ): Promise<ExecutionStep[]> {
   try {
-    const agentList = availableAgents
-      .filter((a) => a !== "Task_Manager") // don't assign to ourselves
-      .join(", ");
+    const agentList = (availableAgents as any[])
+      .filter((a) => (typeof a === "string" ? a : a.name) !== "Task_Manager")
+      .map((a) =>
+        typeof a === "string"
+          ? a
+          : `${a.name}${a.description ? ` (${a.description})` : ""}${a.capabilities.length ? ` [capabilities: ${a.capabilities.join(", ")}]` : ""}${a.mcps.length ? ` [mcps: ${a.mcps.join(", ")}]` : ""}`
+      )
+      .join("\n");
 
     const messages: SimpleMessage[] = [
       { role: "system", content: TASK_MANAGER_SYSTEM_PROMPT },
       {
         role: "user",
-        content: `Available agents: ${agentList}\n\nTask to decompose: "${taskSummary}"`,
+        content: `Available agents:\n${agentList}\n\nTask to decompose: "${taskSummary}"`,
       },
     ];
 
@@ -141,7 +147,7 @@ export async function breakDownTaskWithLLM(
         assignedAgent: resolveAgent(
           String(step.suggestedAgent || ""),
           String(step.description || ""),
-          availableAgents
+          toNames(availableAgents)
         ),
         status: "pending" as const,
         dependsOn: Array.isArray(step.dependsOn) ? step.dependsOn : [],
@@ -155,7 +161,12 @@ export async function breakDownTaskWithLLM(
   }
 
   // ── Fallback: convert hardcoded subtasks into ExecutionSteps ──
-  return fallbackDecomposition(taskSummary, availableAgents);
+  return fallbackDecomposition(taskSummary, toNames(availableAgents));
+}
+
+/** Normalize string[] | AgentManifest[] → string[] of names */
+function toNames(agents: string[] | AgentManifest[]): string[] {
+  return (agents as any[]).map((a) => (typeof a === "string" ? a : a.name));
 }
 
 /**

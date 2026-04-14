@@ -4,25 +4,14 @@ import {
   buildExecutionPlan,
   createJobFile,
 } from "./task-planner.js";
-import { getAvailableAgents, logAgentFeedbackToContext } from "./agent-coordinator.js";
-import { createTaskContextFromPlan } from "./task-context.js";
+import { logAgentFeedbackToContext } from "./agent-coordinator.js";
+import { discoverAgents } from "./agent-discovery.js";
+import { createTaskContextFromPlan, getActionableSteps, markStepInProgress, markStepCompleted } from "./task-context.js";
+import { executeStep } from "./executor.js";
 import { TaskLogEmitter } from "./task-logger.js";
 import fs from "fs/promises";
 import path from "path";
 
-/**
- * Process a new task from the CEO.
- *
- * Pipeline:
- *  1. Discover available agents
- *  2. Use the LLM to decompose the task into ordered, agent-specific steps
- *  3. Build an ExecutionPlan
- *  4. Write the job file (per-task markdown)
- *  5. Write the TASK_CONTEXT.md (centralized coordination file)
- *  6. Log the initial plan creation as feedback
- *
- * Accepts an optional TaskLogEmitter to stream logs in real-time.
- */
 export async function processTask(
   taskId: string,
   taskSummary: string,
@@ -35,59 +24,61 @@ export async function processTask(
   };
 
   log("step", `Processing task: ${taskSummary}`);
-
-  // Ensure directory exists
   await fs.mkdir(taskDir, { recursive: true });
 
-  // 1. Discover agents
-  const agentsDir = path.resolve(
-    path.dirname(new URL(import.meta.url).pathname),
-    ".."
-  );
-  const availableAgents = await getAvailableAgents(agentsDir);
-  log("info", `Available agents: ${availableAgents.join(", ")}`);
+  // 1. Discover agents with manifests
+  const agentsDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
+  const manifests = await discoverAgents(agentsDir);
+  log("info", `Available agents: ${manifests.map((m) => m.name).join(", ")}`);
 
-  // 2. Decompose with LLM (falls back to keyword-based if LLM fails)
+  // 2. Decompose with LLM using full manifests
   log("step", "Decomposing task with LLM...");
-  const steps = await breakDownTaskWithLLM(taskSummary, availableAgents);
+  const steps = await breakDownTaskWithLLM(taskSummary, manifests);
   log("success", `Got ${steps.length} execution steps`);
 
-  // 3. Build the execution plan
-  const plan = buildExecutionPlan(taskId, taskSummary, steps);
-
-  // Log each step
+  // 3. Build plan
+  let plan = buildExecutionPlan(taskId, taskSummary, steps);
   plan.steps.forEach((step) => {
-    const deps =
-      step.dependsOn.length > 0
-        ? `(after step ${step.dependsOn.join(", ")})`
-        : "(immediate)";
+    const deps = step.dependsOn.length > 0 ? `(after step ${step.dependsOn.join(", ")})` : "(immediate)";
     log("info", `Step ${step.stepNumber}: ${step.description} → ${step.assignedAgent} ${deps}`);
   });
 
-  // 4. Write job file
-  log("step", "Writing job file...");
+  // 4. Write job file + context
   const jobFilePath = await createJobFile(plan, taskDir);
-  log("success", `Job file created: ${jobFilePath}`);
-
-  // 5. Write TASK_CONTEXT.md
-  log("step", "Writing TASK_CONTEXT.md...");
+  log("success", `Job file: ${jobFilePath}`);
   const contextFilePath = await createTaskContextFromPlan(plan, taskDir);
-  log("success", `Context file created: ${contextFilePath}`);
+  log("success", `Context file: ${contextFilePath}`);
 
-  // 6. Log initial feedback
-  await logAgentFeedbackToContext(
-    contextFilePath,
-    "Task_Manager",
-    0,
-    `Task decomposed into ${steps.length} steps and assigned to agents. Ready for execution.`,
-    "info"
-  );
+  await logAgentFeedbackToContext(contextFilePath, "Task_Manager", 0,
+    `Task decomposed into ${steps.length} steps. Starting execution.`, "info");
 
-  log("success", "Task is ready for agent execution");
+  // 5. Execute steps in dependency order
+  log("step", "Starting step execution...");
+  const executed = new Set<number>();
 
-  if (logger) {
-    logger.done(`Task ${taskId} processed — ${steps.length} steps assigned`);
+  while (executed.size < plan.steps.length) {
+    const actionable = getActionableSteps(plan).filter((s) => !executed.has(s.stepNumber));
+
+    if (actionable.length === 0) {
+      // Check if we're stuck (remaining steps are failed/blocked)
+      const remaining = plan.steps.filter((s) => !executed.has(s.stepNumber));
+      if (remaining.every((s) => s.status === "failed" || s.status === "blocked")) break;
+      // Otherwise wait — shouldn't happen in sequential mode but guard anyway
+      break;
+    }
+
+    for (const step of actionable) {
+      plan = await markStepInProgress(contextFilePath, plan, step.stepNumber);
+      const report = await executeStep(step, plan, contextFilePath, logger);
+      plan = await markStepCompleted(contextFilePath, plan, step.stepNumber, report.contextSummary);
+      executed.add(step.stepNumber);
+    }
   }
+
+  const allDone = plan.steps.every((s) => s.status === "completed");
+  log(allDone ? "success" : "warn", allDone ? "All steps completed." : "Some steps did not complete.");
+
+  if (logger) logger.done(`Task ${taskId} finished — ${executed.size}/${plan.steps.length} steps completed`);
 
   return { plan, contextFilePath };
 }

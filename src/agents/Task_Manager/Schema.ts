@@ -116,3 +116,23 @@ Return ONLY valid JSON with this shape:
 \`\`\`
 
 IMPORTANT: Return ONLY the raw JSON object. No markdown fences, no extra text.`;
+
+// ── Agent Manifest & Report ──────────────────────────────────
+
+/** Describes an agent's identity and capabilities (read from manifest.json) */
+export interface AgentManifest {
+  name: string;
+  description: string;
+  capabilities: string[];
+  mcps: string[];
+}
+
+/** Structured result returned by an agent after executing a step */
+export interface AgentReport {
+  stepNumber: number;
+  agent: string;
+  status: "success" | "failed";
+  output: string;
+  error?: string;
+  contextSummary: string;
+}
